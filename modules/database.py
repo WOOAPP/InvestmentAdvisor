@@ -2,8 +2,46 @@ import sqlite3
 import json
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_WARSAW = ZoneInfo("Europe/Warsaw")
+
+
+def _now_warsaw():
+    """Return current datetime in Europe/Warsaw timezone."""
+    return datetime.now(_WARSAW)
 
 DB_PATH = "data/advisor.db"
+
+def _migrate_reports_usage(conn):
+    """Add usage columns to reports table if missing (backward-compat migration)."""
+    c = conn.cursor()
+    existing = {row[1] for row in c.execute("PRAGMA table_info(reports)").fetchall()}
+    for col, coltype, default in [
+        ("input_tokens", "INTEGER", "0"),
+        ("output_tokens", "INTEGER", "0"),
+    ]:
+        if col not in existing:
+            c.execute(f"ALTER TABLE reports ADD COLUMN {col} {coltype} DEFAULT {default}")
+    conn.commit()
+
+
+def _migrate_portfolio_currency(conn):
+    """Add currency columns to portfolio table if missing (backward-compat)."""
+    c = conn.cursor()
+    existing = {row[1] for row in c.execute("PRAGMA table_info(portfolio)").fetchall()}
+    for col, coltype, default in [
+        ("buy_currency", "TEXT", "'USD'"),
+        ("buy_fx_to_usd", "REAL", "1.0"),
+        ("buy_price_usd", "REAL", "0"),
+    ]:
+        if col not in existing:
+            c.execute(f"ALTER TABLE portfolio ADD COLUMN {col} {coltype} DEFAULT {default}")
+    # Back-fill buy_price_usd for existing rows (legacy = USD, so price_usd == buy_price)
+    if "buy_price_usd" not in existing:
+        c.execute("UPDATE portfolio SET buy_price_usd = buy_price WHERE buy_price_usd = 0 OR buy_price_usd IS NULL")
+    conn.commit()
+
 
 def init_db():
     """Tworzy tabele jeśli nie istnieją."""
@@ -18,7 +56,9 @@ def init_db():
             model TEXT,
             market_summary TEXT,
             analysis TEXT,
-            risk_level INTEGER
+            risk_level INTEGER,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0
         )
     """)
     c.execute("""
@@ -47,20 +87,37 @@ def init_db():
             name TEXT,
             quantity REAL NOT NULL,
             buy_price REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            buy_currency TEXT DEFAULT 'USD',
+            buy_fx_to_usd REAL DEFAULT 1.0,
+            buy_price_usd REAL DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS instrument_profiles (
+            symbol TEXT PRIMARY KEY,
+            profile_text TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
     conn.commit()
+    _migrate_reports_usage(conn)
+    _migrate_portfolio_currency(conn)
     conn.close()
 
-def save_report(provider, model, market_summary, analysis, risk_level=0):
+def save_report(provider, model, market_summary, analysis, risk_level=0,
+                input_tokens=0, output_tokens=0):
     """Zapisuje raport do bazy."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO reports (created_at, provider, model, market_summary, analysis, risk_level)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), provider, model, market_summary, analysis, risk_level))
+        INSERT INTO reports
+            (created_at, provider, model, market_summary, analysis,
+             risk_level, input_tokens, output_tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (_now_warsaw().strftime("%Y-%m-%d %H:%M:%S"), provider, model,
+          market_summary, analysis, risk_level,
+          int(input_tokens or 0), int(output_tokens or 0)))
     report_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -88,11 +145,20 @@ def get_report_by_id(report_id):
     conn.close()
     return row
 
+def get_latest_report():
+    """Zwraca najnowszy raport (po id malejąco) lub None."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM reports ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return row
+
 def save_market_snapshot(market_data):
     """Zapisuje snapshot cen rynkowych."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = _now_warsaw().strftime("%Y-%m-%d %H:%M:%S")
     for symbol, d in market_data.items():
         if "error" not in d:
             c.execute("""
@@ -122,7 +188,7 @@ def add_alert(symbol, message):
     c.execute("""
         INSERT INTO alerts (created_at, symbol, message)
         VALUES (?, ?, ?)
-    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, message))
+    """, (_now_warsaw().strftime("%Y-%m-%d %H:%M:%S"), symbol, message))
     conn.commit()
     conn.close()
 
@@ -153,22 +219,30 @@ def delete_report(report_id):
 
 # ── PORTFOLIO ──
 
-def add_portfolio_position(symbol, name, quantity, buy_price):
+def add_portfolio_position(symbol, name, quantity, buy_price,
+                           buy_currency="USD", buy_fx_to_usd=1.0):
+    buy_price_usd = float(buy_price) * float(buy_fx_to_usd)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO portfolio (symbol, name, quantity, buy_price, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO portfolio
+            (symbol, name, quantity, buy_price, created_at,
+             buy_currency, buy_fx_to_usd, buy_price_usd)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (symbol, name or symbol, float(quantity), float(buy_price),
-          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+          _now_warsaw().strftime("%Y-%m-%d %H:%M:%S"),
+          buy_currency, float(buy_fx_to_usd), buy_price_usd))
     conn.commit()
     conn.close()
 
 def get_portfolio_positions():
+    """Returns tuples: (id, symbol, name, qty, buy_price, created_at,
+                        buy_currency, buy_fx_to_usd, buy_price_usd)"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT id, symbol, name, quantity, buy_price, created_at
+        SELECT id, symbol, name, quantity, buy_price, created_at,
+               buy_currency, buy_fx_to_usd, buy_price_usd
         FROM portfolio ORDER BY created_at
     """)
     rows = c.fetchall()
@@ -181,6 +255,31 @@ def delete_portfolio_position(position_id):
     c.execute("DELETE FROM portfolio WHERE id = ?", (position_id,))
     conn.commit()
     conn.close()
+
+# ── INSTRUMENT PROFILES ──
+
+def get_instrument_profile(symbol):
+    """Zwraca (profile_text, created_at) lub None."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT profile_text, created_at FROM instrument_profiles WHERE symbol = ?",
+        (symbol,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def save_instrument_profile(symbol, profile_text):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO instrument_profiles (symbol, profile_text, created_at)
+        VALUES (?, ?, ?)
+    """, (symbol, profile_text, _now_warsaw().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
 
 # Inicjalizacja przy imporcie
 init_db()

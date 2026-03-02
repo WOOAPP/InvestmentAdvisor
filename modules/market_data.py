@@ -1,15 +1,14 @@
 import yfinance as yf
-import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
+import logging
 import pandas as pd
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import get_api_key
+from modules.http_client import safe_get
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-}
+logger = logging.getLogger(__name__)
 
 # ── YAHOO FINANCE ──
 def get_yfinance_data(symbol, name=""):
@@ -18,21 +17,45 @@ def get_yfinance_data(symbol, name=""):
         hist = ticker.history(period="5d")
         if hist.empty:
             return {"name": name or symbol, "error": "brak danych"}
-        current = hist["Close"].iloc[-1]
-        prev = hist["Close"].iloc[-2] if len(hist) >= 2 else current
+
+        # Robust conversion - handle NaN, strings, and non-numeric values
+        closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if closes.empty:
+            return {"name": name or symbol, "error": "brak danych cenowych"}
+
+        current = float(closes.iloc[-1])
+        prev = float(closes.iloc[-2]) if len(closes) >= 2 else current
         change = current - prev
         change_pct = (change / prev) * 100 if prev != 0 else 0
+
+        # Handle volume safely (indices often have NaN volume)
+        vol = 0
+        if "Volume" in hist.columns:
+            last_vol = hist["Volume"].iloc[-1]
+            if pd.notna(last_vol):
+                try:
+                    vol = int(float(last_vol))
+                except (ValueError, TypeError):
+                    vol = 0
+
+        sparkline = []
+        for v in closes.tolist():
+            try:
+                sparkline.append(round(float(v), 4))
+            except (ValueError, TypeError):
+                pass
+
         return {
             "name": name or symbol,
             "price": round(current, 4),
             "change": round(change, 4),
             "change_pct": round(change_pct, 2),
-            "volume": int(hist["Volume"].iloc[-1]) if "Volume" in hist else 0,
-            "high_5d": round(hist["Close"].max(), 4),
-            "low_5d": round(hist["Close"].min(), 4),
-            "sparkline": [round(v, 4) for v in hist["Close"].tolist()],
+            "volume": vol,
+            "high_5d": round(float(closes.max()), 4),
+            "low_5d": round(float(closes.min()), 4),
+            "sparkline": sparkline,
             "source": "yfinance",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+            "timestamp": datetime.now(ZoneInfo("Europe/Warsaw")).strftime("%Y-%m-%d %H:%M")
         }
     except Exception as e:
         return {"name": name or symbol, "error": str(e)}
@@ -43,7 +66,7 @@ def get_coingecko_data(coin_id, name=""):
         url = (f"https://api.coingecko.com/api/v3/simple/price"
                f"?ids={coin_id}&vs_currencies=usd"
                f"&include_24hr_change=true&include_24hr_vol=true")
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = safe_get(url)
         data = r.json().get(coin_id, {})
         if not data:
             return {"name": name or coin_id, "error": "brak danych CoinGecko"}
@@ -51,21 +74,35 @@ def get_coingecko_data(coin_id, name=""):
         try:
             chart_url = (f"https://api.coingecko.com/api/v3/coins/{coin_id}"
                          f"/market_chart?vs_currency=usd&days=5&interval=daily")
-            cr = requests.get(chart_url, headers=HEADERS, timeout=8)
+            cr = safe_get(chart_url)
             sparkline = [round(p[1], 4) for p in cr.json().get("prices", [])]
         except Exception:
             pass
+
+        price = data.get("usd", 0)
+        change_pct = round(data.get("usd_24h_change", 0), 2)
+
+        # Calculate change, high_5d, low_5d from sparkline data
+        change = 0
+        high_5d = 0
+        low_5d = 0
+        if sparkline:
+            high_5d = max(sparkline)
+            low_5d = min(sparkline)
+            if len(sparkline) >= 2:
+                change = round(sparkline[-1] - sparkline[-2], 4)
+
         return {
             "name": name or coin_id,
-            "price": data.get("usd", 0),
-            "change_pct": round(data.get("usd_24h_change", 0), 2),
+            "price": price,
+            "change_pct": change_pct,
             "volume": data.get("usd_24h_vol", 0),
-            "change": 0,
-            "high_5d": 0,
-            "low_5d": 0,
+            "change": change,
+            "high_5d": high_5d,
+            "low_5d": low_5d,
             "sparkline": sparkline,
             "source": "coingecko",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+            "timestamp": datetime.now(ZoneInfo("Europe/Warsaw")).strftime("%Y-%m-%d %H:%M")
         }
     except Exception as e:
         return {"name": name or coin_id, "error": str(e)}
@@ -74,7 +111,7 @@ def get_coingecko_data(coin_id, name=""):
 def get_stooq_data(symbol, name=""):
     try:
         url = f"https://stooq.pl/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = safe_get(url)
         lines = r.text.strip().split("\n")
         if len(lines) < 2:
             return {"name": name or symbol, "error": "brak danych Stooq"}
@@ -92,11 +129,50 @@ def get_stooq_data(symbol, name=""):
             "volume": int(float(parts[7])) if len(parts) > 7 else 0,
             "high_5d": round(float(parts[5]), 4),
             "low_5d": round(float(parts[4]), 4),
+            "sparkline": [round(open_, 4), round(close, 4)],
             "source": "stooq",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+            "timestamp": datetime.now(ZoneInfo("Europe/Warsaw")).strftime("%Y-%m-%d %H:%M")
         }
     except Exception as e:
         return {"name": name or symbol, "error": str(e)}
+
+# ── FX RATES CACHE ──
+_fx_cache = {}       # {"PLNUSD": (rate, timestamp), ...}
+_FX_CACHE_TTL = 600  # seconds
+
+def get_fx_to_usd(currency):
+    """Return the multiplier that converts *currency* → USD.
+
+    E.g. for PLN it returns ~0.25 (1 PLN = 0.25 USD).
+    USD returns 1.0 immediately.  On failure returns None.
+    """
+    currency = currency.upper()
+    if currency == "USD":
+        return 1.0
+
+    import time
+    cache_key = f"{currency}USD"
+    cached = _fx_cache.get(cache_key)
+    if cached and (time.time() - cached[1]) < _FX_CACHE_TTL:
+        return cached[0]
+
+    # yfinance ticker format: PLNUSD=X, EURUSD=X
+    ticker_symbol = f"{currency}USD=X"
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        hist = ticker.history(period="5d")
+        if hist.empty:
+            return None
+        closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if closes.empty:
+            return None
+        rate = float(closes.iloc[-1])
+        _fx_cache[cache_key] = (rate, time.time())
+        return rate
+    except Exception as e:
+        logger.warning("FX fetch %s failed: %s", ticker_symbol, e)
+        return None
+
 
 # ── POBIERZ WSZYSTKIE INSTRUMENTY ──
 def get_all_instruments(instruments_config):
@@ -126,7 +202,9 @@ def get_market_data(symbols):
         results[s] = get_yfinance_data(s)
     return results
 
-def get_crypto_data(coins=["bitcoin", "ethereum"]):
+def get_crypto_data(coins=None):
+    if coins is None:
+        coins = ["bitcoin", "ethereum"]
     results = {}
     sym_map = {"bitcoin": "BTC-USD", "ethereum": "ETH-USD"}
     for coin in coins:
@@ -134,25 +212,33 @@ def get_crypto_data(coins=["bitcoin", "ethereum"]):
     return results
 
 def get_news(api_key, query="economy geopolitics markets", language="pl", page_size=10):
+    """Fetch latest news from Newsdata.io (legacy/fallback function)."""
     if not api_key:
         return []
     try:
-        url = (f"https://newsapi.org/v2/everything?"
-               f"q={query}&language={language}&sortBy=publishedAt"
-               f"&pageSize={page_size}&apiKey={api_key}")
-        r = requests.get(url, timeout=10)
+        url = (f"https://newsdata.io/api/1/latest?"
+               f"apikey={api_key}&q={query}&language={language}"
+               f"&size={min(page_size, 50)}")
+        r = safe_get(url)
         data = r.json()
+        if data.get("status") == "error":
+            err = data.get("results", {})
+            msg = err.get("message", "") if isinstance(err, dict) else str(err)
+            logger.error("Newsdata.io error: %s", msg)
+            return [{"error": msg}]
         return [
             {
                 "title": a.get("title", ""),
                 "description": a.get("description", ""),
-                "source": a.get("source", {}).get("name", ""),
-                "url": a.get("url", ""),
-                "published": a.get("publishedAt", "")
+                "source": a.get("source_id") or "",
+                "url": a.get("link") or "",
+                "published": a.get("pubDate", "")
             }
-            for a in data.get("articles", []) if a.get("title")
+            for a in data.get("results", [])
+            if isinstance(a, dict) and a.get("title")
         ]
     except Exception as e:
+        logger.error("Błąd pobierania newsów: %s", e)
         return [{"error": str(e)}]
 
 def format_market_summary(market_data, crypto_data=None):
